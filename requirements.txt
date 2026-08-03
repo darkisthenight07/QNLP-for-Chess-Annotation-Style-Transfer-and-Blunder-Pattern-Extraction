@@ -1,1 +1,8 @@
 SQLAlchemy
+chess
+lambeq
+pennylane
+torch
+numpy
+scikit-learn
+matplotlib
