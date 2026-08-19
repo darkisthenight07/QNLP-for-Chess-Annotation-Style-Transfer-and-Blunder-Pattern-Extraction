@@ -1,6 +1,5 @@
 import numpy as np
 from lambeq import NumpyModel, SPSAOptimizer
-
 from quantum.ansatz import N_CLASSES, LABEL_MAP
 
 
