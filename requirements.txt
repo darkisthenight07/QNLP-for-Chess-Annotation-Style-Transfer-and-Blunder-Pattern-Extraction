@@ -1,8 +1,8 @@
-SQLAlchemy
-chess
-lambeq
-pennylane
-torch
-numpy
-scikit-learn
-matplotlib
+SQLAlchemy>=2.0
+chess>=1.10
+lambeq>=0.4.1
+pennylane>=0.36
+torch>=2.0
+numpy>=1.26
+scikit-learn>=1.4
+matplotlib>=3.8
