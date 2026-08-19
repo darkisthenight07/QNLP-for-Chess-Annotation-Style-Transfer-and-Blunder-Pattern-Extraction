@@ -1,70 +1,115 @@
 # QNLP for Chess Annotation Style Transfer and Blunder Pattern Extraction
 
-A quantum natural language processing pipeline that classifies chess blunder types from grandmaster commentary and learns to transfer annotation style between engine output and human GM language.
-
-Built using the **DisCoCat** (Distributional Compositional Categorical) framework via `lambeq`, with quantum simulation via `PennyLane`.
+A quantum natural language processing pipeline that classifies chess blunder types from grandmaster commentary and transfers annotation style from engine output to human GM language — using the DisCoCat compositional framework, IQP quantum circuits, and nearest-neighbour quantum embedding retrieval.
 
 ---
 
-## What This Project Does
+## Folder Structure
 
-Chess annotations like *"White misses the fork on d5"* have compositional grammatical structure that mirrors the logical structure of the chessboard. Classical NLP ignores this structure. This project instead:
-
-1. **Parses** each annotation sentence through a CCG grammar parser (Bobcat) to produce a string diagram — a wiring blueprint where each word is a typed morphism.
-2. **Compiles** that diagram into a parameterised quantum circuit using the IQP (Instantaneous Quantum Polynomial) ansatz, where nouns become qubit states and grammatical reductions (subject-verb-object contractions) become entangling gates.
-3. **Trains** the circuit parameters end-to-end to classify annotations into four blunder categories: tactical oversight, positional degradation, time pressure, and opening mistake.
-4. **Learns a style transfer channel** — a small unitary U(φ) on the sentence qubit register — that rotates engine-style sentence embeddings toward grandmaster-style embeddings.
+```
+chess_qnlp/
+│
+├── main.py                    ← run this to execute the full pipeline
+├── config.py                  ← all paths, thresholds, and constants
+├── models.py                  ← SQLAlchemy ORM (5 database tables)
+├── requirements.txt
+├── README.md
+│
+├── pgn_files/                 ← PUT YOUR .pgn FILES HERE
+│   └── (your files).pgn
+│
+├── results/                   ← plots are saved here automatically
+│   ├── training.png
+│   └── embeddings.png
+│
+├── chess_qnlp.db              ← SQLite database (auto-created on first run)
+│
+├── data/
+│   ├── __init__.py
+│   ├── ingest.py              ← reads PGN files, writes Game/Move/Annotation rows to DB
+│   ├── label.py               ← assigns blunder category + confidence to each annotation
+│   └── preprocess.py          ← converts chess notation to plain English before parsing
+│
+├── parse/
+│   ├── __init__.py
+│   └── ccg_parser.py          ← CCG parsing → string diagrams → IQP circuits
+│
+└── quantum/
+    ├── __init__.py
+    ├── ansatz.py              ← qubit counts, label map, ansatz builder
+    ├── device.py              ← GPU-aware device selector (lightning → CPU fallback)
+    ├── train.py               ← NumpyModel + SPSA classifier training loop
+    ├── transfer.py            ← style transfer unitary U(φ) via PennyLane
+    ├── decode.py              ← nearest-neighbour retrieval decoder (quantum state → text)
+    └── evaluate.py            ← accuracy report, PCA embeddings plot, training curves
+```
 
 ---
 
-## Project Status
+## What Each File Does
 
-This is a working prototype. The pipeline is complete end-to-end. What it does well:
+### Root
 
-- Full PGN ingestion and structured SQLite storage
-- Eval-drop + keyword labeling with confidence scores
-- CCG parsing via lambeq's Bobcat parser (pre-trained neural supertagger)
-- IQP circuit compilation from grammatical string diagrams
-- SPSA-based quantum circuit training (hardware-safe, no backprop through circuits)
-- Quantum channel learning for style transfer via PennyLane parameter-shift gradients
+| File | Purpose |
+|------|---------|
+| `main.py` | Runs all 11 pipeline steps in order. Entry point for everything. |
+| `config.py` | Single source of truth for DB path, PGN directory, blunder centipawn thresholds, sentence length limits. Edit this to tune the pipeline. |
+| `models.py` | SQLAlchemy ORM defining 5 tables: `games`, `moves`, `annotations`, `corpus_sentences`, `blunder_labels`. Do not edit unless adding new columns. |
 
-What is limited by current qubit counts:
+### `data/`
 
-- Sentence circuits are small (2–6 qubits depending on sentence length). This is fine for simulation but constrains expressivity.
-- Style transfer decodes quantum states back to text via nearest-neighbour lookup, not generation. True quantum text generation requires far more qubits than current simulators handle practically.
-- Training on the full Lichess corpus would require moving from `NumpyModel` (exact simulation) to `TketModel` with a real backend (IBM, IonQ), or a GPU-accelerated simulator.
+| File | Purpose |
+|------|---------|
+| `ingest.py` | Opens every `.pgn` in `pgn_files/`, walks the game tree node by node, extracts Stockfish `[%eval ...]` tags, computes centipawn eval drop between consecutive moves, splits annotation text into sentences, and writes everything to SQLite. |
+| `label.py` | Reads annotations from the DB, scores them against keyword lists (tactical, positional, time, opening) and against eval-drop thresholds, combines both signals into a category + confidence score, writes a `BlunderLabel` row per annotation. |
+| `preprocess.py` | Converts chess-specific tokens to English before CCG parsing. `Nf3!` becomes `knight moves to f3`, `Bxf7+` becomes `bishop captures on f7`, `??` becomes `blunder`, bare squares like `d5` become `square d5`. Without this, Bobcat returns `None` for most chess sentences. |
+
+### `parse/`
+
+| File | Purpose |
+|------|---------|
+| `ccg_parser.py` | Runs `preprocess.normalise()` on every sentence, filters by token length, feeds to Bobcat CCG parser, converts valid derivations to DisCoCat string diagrams, applies the IQP ansatz to compile them into parameterised quantum circuits. |
+
+### `quantum/`
+
+| File | Purpose |
+|------|---------|
+| `ansatz.py` | Stores `N_NOUN_QUBITS`, `N_SENTENCE_QUBITS`, `N_CLASSES`, `LABEL_MAP`. Exposes `build_ansatz()`. Every other quantum file imports constants from here — change qubit counts in one place. |
+| `device.py` | Tries `lightning.gpu` → `lightning.qubit` → `default.qubit` in order and returns the fastest available PennyLane device. Also returns the correct differentiation method (`adjoint` for Lightning, `parameter-shift` for default). |
+| `train.py` | Builds a `NumpyModel` from the compiled circuits, runs mini-batch SPSA training, logs loss and accuracy per epoch, returns the trained model and history dict. |
+| `transfer.py` | Defines the style transfer QNode using the device from `device.py`. Trains U(φ) — a hardware-efficient 2-qubit unitary — to minimise infidelity between engine and GM sentence states. |
+| `decode.py` | Builds a retrieval index over all GM sentences by storing their quantum probability vectors. At inference, applies U(φ) to an engine sentence state, converts to probabilities, and returns the top-k GM sentences by cosine similarity. This is what produces actual English text output. |
+| `evaluate.py` | Prints per-class recall table. Saves `results/training.png` (loss + accuracy + infidelity curves) and `results/embeddings.png` (PCA of sentence quantum embeddings coloured by blunder class). |
 
 ---
 
 ## Prerequisites
 
-### Python version
+### Python
 
-Python **3.11** or **3.12**. Do not use 3.13 — `lambeq` and `pennylane` have not fully validated on it yet.
-
-Check yours:
+Python **3.11** or **3.12**. Check with:
 
 ```bash
 python --version
 ```
 
-### System dependencies
+### Java (required for Bobcat CCG parser)
 
-`lambeq` uses a Java-based CCG parser (EasyCCG/Bobcat) under the hood.
+`lambeq` uses a Java-based parser under the hood.
 
-**macOS:**
+**macOS**
 ```bash
 brew install openjdk@17
 ```
 
-**Ubuntu / Debian:**
+**Ubuntu / Debian**
 ```bash
 sudo apt install openjdk-17-jre-headless
 ```
 
-**Windows:** Download and install [OpenJDK 17](https://adoptium.net/). Add it to your PATH.
+**Windows** — download from [adoptium.net](https://adoptium.net), install, and add to PATH.
 
-Verify Java is available:
+Verify:
 ```bash
 java -version
 ```
@@ -74,52 +119,23 @@ java -version
 ## Installation
 
 ```bash
-# 1. Clone the repo
+# 1. Clone
 git clone https://github.com/darkisthenight07/QNLP-for-Chess-Annotation-Style-Transfer-and-Blunder-Pattern-Extraction.git
 cd QNLP-for-Chess-Annotation-Style-Transfer-and-Blunder-Pattern-Extraction
 
-# 2. Create a virtual environment (strongly recommended)
+# 2. Virtual environment
 python -m venv venv
-source venv/bin/activate          # macOS / Linux
-venv\Scripts\activate             # Windows
+source venv/bin/activate        # Windows: venv\Scripts\activate
 
 # 3. Install dependencies
 pip install -r requirements.txt
 
-# 4. lambeq downloads its Bobcat model weights on first use (~200 MB)
-#    Run this once to trigger the download before running the pipeline:
+# 4. Optional — GPU acceleration for style transfer
+pip install pennylane-lightning          # CPU C++ backend (always worth installing)
+pip install pennylane-lightning[gpu]     # NVIDIA GPU backend (requires CUDA)
+
+# 5. Download Bobcat model weights — one time, ~200 MB
 python -c "from lambeq import BobcatParser; BobcatParser()"
-```
-
----
-
-## File Structure
-
-```
-chess_qnlp/
-│
-├── README.md
-├── requirements.txt
-├── config.py                  ← paths, DB URL, blunder thresholds
-├── models.py                  ← SQLAlchemy ORM (5 tables)
-├── main.py                    ← full pipeline entry point
-│
-├── pgn_files/                 ← PUT YOUR PGN FILES HERE (created on first run)
-├── results/                   ← plots saved here (created on first run)
-├── chess_qnlp.db              ← SQLite database (created on first run)
-│
-├── data/
-│   ├── ingest.py              ← PGN parsing → SQLite
-│   └── label.py               ← eval drop + keywords → blunder label
-│
-├── parse/
-│   └── ccg_parser.py          ← Bobcat CCG → string diagram → IQP circuit
-│
-└── quantum/
-    ├── ansatz.py              ← ansatz config, qubit counts, label map
-    ├── train.py               ← NumpyModel + SPSA training loop
-    ├── transfer.py            ← PennyLane style transfer channel
-    └── evaluate.py            ← accuracy report, PCA plot, training curves
 ```
 
 ---
@@ -128,153 +144,158 @@ chess_qnlp/
 
 ### Where to get PGN files
 
-The project is built around annotated games — PGNs where moves have `{ comment }` blocks with Stockfish evaluations or human annotations.
+| Source | What to get | Link |
+|--------|-------------|------|
+| Lichess Open Database | Monthly exports with Stockfish evals | https://database.lichess.org |
+| TWIC | Weekly GM tournament games | https://theweekinchess.com/twic |
+| PGN Mentor | Annotated classic collections | https://www.pgnmentor.com |
 
-**Best free sources:**
+### What format the PGN needs
 
-| Source | What to download | URL |
-|--------|-----------------|-----|
-| Lichess Open Database | Monthly PGN exports with Stockfish evals | https://database.lichess.org |
-| TWIC (This Week in Chess) | GM tournament games, often annotated | https://theweekinchess.com/twic |
-| PGN Mentor | Classic annotated game collections | https://www.pgnmentor.com |
-
-### What format the PGN needs to have
-
-The ingestion script looks for Stockfish evaluation comments in this format inside `{ }` blocks:
+The pipeline reads Stockfish evaluation comments in standard Lichess format:
 
 ```
-1. e4 { [%eval 0.17] } e5 { [%eval 0.25] } 2. Nf3 { [%eval -1.50] [%clk 0:05:00] } ...
+1. e4 { [%eval 0.17] } e5 { [%eval 0.19] } 2. Nf3 { [%eval -1.50] } ...
 ```
 
-Lichess exports with evaluations turned on use exactly this format. Games without any `{ }` comments will be stored but produce no sentences or labels.
+Games without any `{ }` comment blocks are stored in the DB but produce no labeled sentences. Download Lichess exports with the **"with evaluations"** option enabled on their database page.
 
-### How to add your files
+### Where to put your files
+
+Drop any number of `.pgn` files directly into `pgn_files/`:
 
 ```
 chess_qnlp/
 └── pgn_files/
-    ├── lichess_2024_01.pgn
-    ├── kasparov_annotated.pgn
+    ├── lichess_2024_january.pgn
+    ├── kasparov_deep_blue.pgn
     └── twic_1500.pgn
 ```
 
-Just drop any number of `.pgn` files into the `pgn_files/` folder. The ingestion script reads all of them automatically.
+The ingestion script reads all of them automatically.
 
-**Recommended starting size:** 500–2000 annotated games gives enough labeled sentences to train meaningfully. The full Lichess monthly exports are millions of games — start with a filtered subset (e.g. games rated 2000+ with evals enabled, which you can filter on the Lichess database page before downloading).
+**Recommended starting size:** 500–2000 annotated games. The Lichess monthly exports are very large — filter on their website for games rated 2000+ with evaluations before downloading.
 
 ---
 
 ## Running the Pipeline
 
-### Full pipeline (recommended first run)
+### Full run
 
 ```bash
 python main.py
 ```
 
-This runs all phases in order:
-1. Ingests all PGN files from `pgn_files/` into SQLite
-2. Labels annotations with blunder categories
-3. Loads labeled sentences, parses them with Bobcat CCG
-4. Compiles IQP quantum circuits
-5. Trains the blunder classifier (120 epochs, SPSA)
-6. Evaluates and saves plots to `results/`
-7. Trains the style transfer channel (200 epochs)
-8. Runs inference on four sample sentences
+Runs all 11 steps:
 
-### Running individual phases
+| Step | What happens |
+|------|-------------|
+| 1 | Ingest all PGN files from `pgn_files/` into SQLite |
+| 2 | Assign blunder category labels to annotations |
+| 3 | Load labeled sentences from DB (confidence ≥ 0.6) |
+| 4 | Normalise chess notation, parse CCG, compile IQP circuits |
+| 5 | Train blunder classifier with SPSA (120 epochs) |
+| 6 | Print per-class recall, save embedding PCA plot |
+| 7 | Train style transfer channel U(φ) (200 epochs) |
+| 8 | Build GM retrieval index for the decoder |
+| 9 | Save training curves to `results/training.png` |
+| 10 | Run sample blunder classification, print predictions |
+| 11 | Run sample style transfer, print top-3 GM sentence candidates |
+
+### Running individual steps
 
 ```bash
-# Phase 1a: ingest PGN files only
+# Ingest PGN files only
 python -m data.ingest
 
-# Phase 1b: label the annotations
+# Label annotations only
 python -m data.label
 
-# Phase 2: parse sentences and print sample circuits
+# Test the notation normaliser
+python -m data.preprocess
+
+# Parse a small sample and print circuits
 python -m parse.ccg_parser
 ```
-
-### Expected runtime
-
-| Phase | What happens | Typical time |
-|-------|-------------|--------------|
-| Ingestion | PGN parsing, DB writes | ~1 min per 1000 games |
-| Labeling | SQL queries + keyword scan | <30 seconds |
-| CCG parsing | Bobcat neural supertagger | ~2–5 sec per 100 sentences |
-| Circuit compilation | IQP ansatz application | ~1 sec per 100 circuits |
-| Classifier training | 120 epochs, NumpyModel sim | ~5–20 min (CPU) |
-| Style transfer | 200 epochs, PennyLane | ~10–30 min (CPU) |
 
 ---
 
 ## Configuration
 
-All tuneable values are in `config.py`:
+### `config.py`
 
 ```python
-# Blunder category centipawn thresholds (eval drop in centipawns)
+# Centipawn eval drop thresholds for blunder labeling
 BLUNDER_THRESHOLDS = {
-    "tactical_oversight":     -200,   # massive blunder, hung a piece
+    "tactical_oversight":     -200,   # hung a piece, missed mate
     "positional_degradation":  -80,   # structural damage
-    "time_pressure":           -50,   # moderate error
+    "time_pressure":           -50,   # moderate error under clock
     "opening_mistake":         -30,   # early concession
 }
 
-# Sentence length filter for CCG parsing
-MIN_SENTENCE_TOKENS = 3
-MAX_SENTENCE_TOKENS = 12
+MIN_SENTENCE_TOKENS = 3    # shorter than this → filtered before CCG
+MAX_SENTENCE_TOKENS = 12   # longer than this → too complex for IQP at 1–2 qubits
 ```
 
-To change qubit counts or circuit depth, edit `quantum/ansatz.py`:
+### `quantum/ansatz.py`
 
 ```python
 N_NOUN_QUBITS     = 1   # qubits per noun word
-N_SENTENCE_QUBITS = 2   # qubits for sentence register (2^2 = 4 classes)
+N_SENTENCE_QUBITS = 2   # qubits for sentence register
 N_LAYERS          = 1   # IQP circuit depth
+N_CLASSES         = 4   # must equal 2 ** N_SENTENCE_QUBITS
 ```
 
-If you change `N_SENTENCE_QUBITS`, also update `N_CLASSES` to `2 ** N_SENTENCE_QUBITS`.
+If you increase `N_SENTENCE_QUBITS` to 3, set `N_CLASSES = 8` and add 4 more blunder categories to `LABEL_MAP`. Increasing `N_NOUN_QUBITS` to 2 gives richer word representations but doubles the circuit size and simulation time.
 
 ---
 
 ## Outputs
 
-After a full run, `results/` will contain:
-
 | File | Contents |
-|------|----------|
-| `results/training.png` | Classifier loss, train/test accuracy, transfer infidelity curves |
-| `results/embeddings.png` | PCA of sentence qubit distributions, coloured by blunder class |
-
-The terminal prints per-class recall and sample predictions.
+|------|---------|
+| `chess_qnlp.db` | SQLite database with all games, moves, annotations, sentences, labels |
+| `results/training.png` | Three plots: classifier cross-entropy loss, train/test accuracy, style transfer infidelity curve |
+| `results/embeddings.png` | PCA of sentence quantum probability vectors, coloured by blunder class — shows whether the four types are separable in quantum embedding space |
+| Terminal (step 10) | Per-sentence blunder type predictions with probabilities |
+| Terminal (step 11) | For each engine-style sentence: top-3 GM-style candidate sentences with cosine similarity scores |
 
 ---
 
-## Common Errors
+## Troubleshooting
 
-**`lambeq` fails to parse many sentences → returns `None`**
-Normal for sentences that are too short, too long, or contain chess notation the CCG tagger has not seen (e.g. bare move notations like `Nf3`). The pipeline filters these out. Increase your dataset size to compensate.
+**Most sentences return `None` from the parser**
+This happened before `preprocess.py` was added. Make sure you are running the latest `ccg_parser.py` — it now normalises notation before parsing. If you still get low parse rates, check that your PGN comments contain actual English words and not just evaluation tags.
 
-**`Java not found` error on first run**
-Install OpenJDK 17 as described in Prerequisites. The Bobcat parser requires a JVM.
+**`not enough data` error on startup**
+Less than 10 labeled sentences found. Either no PGN files are in `pgn_files/`, the files have no `{ }` comments, or the eval format does not match `[%eval ...]`. Run `python -m data.ingest` separately and check its printed game count.
 
-**`NumpyModel` training is very slow**
-This is exact statevector simulation. On CPU it is O(2^n_qubits) per forward pass. Keep `N_NOUN_QUBITS = 1` and `N_SENTENCE_QUBITS = 2` unless you have significant compute. For GPU acceleration, switch to `pennylane-lightning` (`pip install pennylane-lightning`) and change the device in `quantum/transfer.py` to `"lightning.gpu"`.
+**Style transfer decoder prints nothing**
+Fewer than 4 valid style pairs were found in the DB. This usually means the labeler did not produce enough `positional_degradation` labels. Lower the `BLUNDER_THRESHOLDS["positional_degradation"]` threshold in `config.py` (e.g. from -80 to -40) to label more sentences and retry `python -m data.label`.
 
-**`not enough data` error in `main.py`**
-Less than 10 labeled sentences were found. This means either: no PGN files were added, the PGN files have no `{ }` comments, or the eval format does not match `[%eval ...]`. Check your PGN source.
+**Training is very slow**
+Install `pennylane-lightning` for a C++ CPU backend that is 5–10× faster than the default pure-Python simulator. For NVIDIA GPUs, `pennylane-lightning[gpu]` gives another 10–50× improvement. `quantum/device.py` detects and uses these automatically — no code changes needed.
+
+**Java not found**
+Install OpenJDK 17 as described in Prerequisites. The Bobcat CCG parser requires a JVM to run the underlying Java supertagger.
 
 ---
 
 ## Dependencies
 
+| Package | Version | Purpose |
+|---------|---------|---------|
+| `lambeq` | ≥ 0.4.1 | DisCoCat framework — CCG parsing, string diagrams, IQP ansatz, NumpyModel, SPSA |
+| `pennylane` | ≥ 0.36 | Style transfer QNode, parameter-shift and adjoint gradients, AdamOptimizer |
+| `SQLAlchemy` | ≥ 2.0 | ORM layer over SQLite |
+| `chess` | ≥ 1.10 | PGN file reading and game tree traversal |
+| `scikit-learn` | ≥ 1.4 | PCA for embedding visualisation |
+| `matplotlib` | ≥ 3.8 | Training curve and embedding plots |
+| `numpy` | ≥ 1.26 | Numerical ops throughout |
+
+Optional:
+
 | Package | Purpose |
 |---------|---------|
-| `lambeq` | DisCoCat framework — CCG parsing, string diagrams, IQP ansatz, NumpyModel |
-| `pennylane` | Quantum circuit simulation for style transfer, parameter-shift gradients |
-| `SQLAlchemy` | ORM layer over SQLite for structured data storage |
-| `chess` | PGN file reading and game tree traversal |
-| `scikit-learn` | PCA for embedding visualisation |
-| `matplotlib` | Training curve and embedding plots |
-| `numpy` | Numerical ops throughout |
+| `pennylane-lightning` | C++ CPU simulator, 5–10× faster than default |
+| `pennylane-lightning[gpu]` | NVIDIA GPU simulator, 10–50× faster |
